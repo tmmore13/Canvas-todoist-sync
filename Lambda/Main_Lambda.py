@@ -1,185 +1,101 @@
-#!/usr/bin/env python3
-"""
-Sync an iCalendar (ICS) feed to a Todoist project, using a config file.
-
-Features:
-- Creates tasks for new events
-- Updates tasks when events change (if update_existing: true)
-- Deletes tasks when events are removed from the calendar
-
-Config:
-    Provide config.json or config.yaml with keys:
-    {
-      "ical_url": "...",
-      "todoist_token": "...",
-      "project_id": "...",
-      "update_existing": true,
-      "dry_run": false
-    }
-"""
-
 import os
-import re
 import json
-import yaml   # pip install pyyaml
 import requests
-from datetime import datetime, date
-from dateutil import tz
-from icalendar import Calendar
+import icalendar
+from datetime import datetime
 
-TODOIST_API_BASE = "https://api.todoist.com/rest/v2"
-DEFAULT_MARKER = "ICUID:"
+DEFAULT_MARKER = "ICAL-"
 
-# -------------------------
-# Helpers
-# -------------------------
+# ---------------- CONFIG ----------------
+def load_config():
+    return {
+        "todoist_api_token": os.environ["TODOIST_API_TOKEN"],
+        "todoist_project_id": os.environ["TODOIST_PROJECT_ID"],
+        "ical_url": os.environ["ICAL_URL"],
+        "marker": os.getenv("MARKER", DEFAULT_MARKER),
+    }
 
-def load_config(path="config.json"):
-    """Load JSON or YAML config file."""
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Config file not found: {path}")
-    if path.endswith(".json"):
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    if path.endswith((".yml", ".yaml")):
-        with open(path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f)
-    raise ValueError("Config file must be .json or .yaml")
+# ---------------- HELPERS ----------------
+def fetch_ical_events(ical_url):
+    resp = requests.get(ical_url)
+    resp.raise_for_status()
+    cal = icalendar.Calendar.from_ical(resp.content)
 
-def isoformat_for_todoist(dt):
-    if isinstance(dt, date) and not isinstance(dt, datetime):
-        return dt.isoformat()
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=tz.tzutc())
-    return dt.isoformat()
-
-def fetch_ics(url):
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    return r.content
-
-def parse_ics(data):
-    cal = Calendar.from_ical(data)
     events = []
-    for comp in cal.walk("VEVENT"):
+    for component in cal.walk("VEVENT"):
         events.append({
-            "uid": str(comp.get("uid", "")),
-            "summary": str(comp.get("summary", "Untitled event")),
-            "description": str(comp.get("description", "") or ""),
-            "location": str(comp.get("location", "") or ""),
-            "dtstart": comp.get("dtstart").dt if comp.get("dtstart") else None,
+            "uid": str(component.get("UID")),
+            "summary": str(component.get("SUMMARY", "")),
+            "description": str(component.get("DESCRIPTION", "")),
+            "location": str(component.get("LOCATION", "")),
+            "start": component.get("DTSTART").dt if component.get("DTSTART") else None,
+            "end": component.get("DTEND").dt if component.get("DTEND") else None,
         })
     return events
 
-def headers(token):
-    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+def fetch_todoist_tasks(api_token, project_id, marker):
+    headers = {"Authorization": f"Bearer {api_token}"}
+    resp = requests.get("https://api.todoist.com/rest/v2/tasks", headers=headers, params={"project_id": project_id})
+    resp.raise_for_status()
+    tasks = resp.json()
 
-def list_tasks(token, project_id):
-    r = requests.get(f"{TODOIST_API_BASE}/tasks", headers=headers(token), params={"project_id": project_id})
-    r.raise_for_status()
-    return r.json()
+    # only tasks created by this sync (marked)
+    return {t["content"]: t for t in tasks if marker in t["content"]}
 
-def find_existing(tasks, marker=DEFAULT_MARKER):
-    mapping = {}
-    regex = re.compile(rf"{re.escape(marker)}([^\s)]+)")
-    for t in tasks:
-        m = regex.search(t.get("content", ""))
-        if m:
-            mapping[m.group(1)] = t
-    return mapping
+def create_task(api_token, project_id, event, marker):
+    headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
+    content = f"{event['summary']} ({marker}{event['uid']})"
 
-def build_content(event, marker):
-    extras = []
-    if event["location"]:
-        extras.append(f"@{event['location']}")
-    if event["description"]:
-        d = event["description"]
-        extras.append(d[:120] + ("..." if len(d) > 120 else ""))
-    content = event["summary"]
-    if extras:
-        content += " — " + " | ".join(extras)
-    return f"{content} ({marker}{event['uid']})"
+    resp = requests.post(
+        "https://api.todoist.com/rest/v2/tasks",
+        headers=headers,
+        data=json.dumps({"content": content, "project_id": project_id}),
+    )
+    resp.raise_for_status()
+    return resp.json()
 
-def create_task(token, project_id, event, marker, dry_run=False):
-    payload = {"content": build_content(event, marker), "project_id": project_id}
-    if event["dtstart"]:
-        iso = isoformat_for_todoist(event["dtstart"])
-        if isinstance(event["dtstart"], date) and not isinstance(event["dtstart"], datetime):
-            payload["due_date"] = iso
-        else:
-            payload["due_datetime"] = iso
-    if dry_run:
-        print("[DRY RUN] Would create:", payload)
-        return
-    r = requests.post(f"{TODOIST_API_BASE}/tasks", headers=headers(token), json=payload)
-    r.raise_for_status()
-    return r.json()
+def delete_task(api_token, task_id):
+    headers = {"Authorization": f"Bearer {api_token}"}
+    resp = requests.delete(f"https://api.todoist.com/rest/v2/tasks/{task_id}", headers=headers)
+    if resp.status_code not in (200, 204):
+        raise Exception(f"Failed to delete task {task_id}: {resp.text}")
 
-def update_task(token, task_id, event, marker, dry_run=False):
-    payload = {"content": build_content(event, marker)}
-    if event["dtstart"]:
-        iso = isoformat_for_todoist(event["dtstart"])
-        if isinstance(event["dtstart"], date) and not isinstance(event["dtstart"], datetime):
-            payload["due_date"] = iso
-        else:
-            payload["due_datetime"] = iso
-    if dry_run:
-        print(f"[DRY RUN] Would update {task_id}:", payload)
-        return
-    r = requests.post(f"{TODOIST_API_BASE}/tasks/{task_id}", headers=headers(token), json=payload)
-    if r.status_code not in (200, 204):
-        r.raise_for_status()
+# ---------------- SYNC ----------------
+def sync_once(cfg):
+    events = fetch_ical_events(cfg["ical_url"])
+    todoist_tasks = fetch_todoist_tasks(cfg["todoist_api_token"], cfg["todoist_project_id"], cfg["marker"])
 
-def delete_task(token, task_id, dry_run=False):
-    if dry_run:
-        print(f"[DRY RUN] Would delete task {task_id}")
-        return
-    r = requests.delete(f"{TODOIST_API_BASE}/tasks/{task_id}", headers=headers(token))
-    if r.status_code not in (200, 204):
-        r.raise_for_status()
+    # map UIDs from events
+    event_uids = {e["uid"]: e for e in events}
+    synced_uids = {c.split(cfg["marker"])[-1].rstrip(")") for c in todoist_tasks}
 
-# -------------------------
-# Main
-# -------------------------
+    created, deleted = [], []
 
-def main():
-    cfg = load_config("config.json")  # change to config.yaml if needed
+    # Create missing events
+    for uid, event in event_uids.items():
+        if uid not in synced_uids:
+            created.append(create_task(cfg["todoist_api_token"], cfg["todoist_project_id"], event, cfg["marker"]))
 
-    ical_url = cfg["ical_url"]
-    token = cfg["todoist_token"]
-    project_id = cfg["project_id"]
-    update_existing = cfg.get("update_existing", False)
-    dry_run = cfg.get("dry_run", False)
+    # Delete tasks whose events are gone
+    for content, task in todoist_tasks.items():
+        uid = content.split(cfg["marker"])[-1].rstrip(")")
+        if uid not in event_uids:
+            delete_task(cfg["todoist_api_token"], task["id"])
+            deleted.append(task["id"])
 
-    events = parse_ics(fetch_ics(ical_url))
-    tasks = list_tasks(token, project_id)
-    existing = find_existing(tasks)
+    return {"created": len(created), "deleted": len(deleted)}
 
-    ical_uids = {ev["uid"] for ev in events if ev["uid"]}
-    created, updated, skipped, deleted = 0, 0, 0, 0
-
-    for ev in events:
-        uid = ev["uid"]
-        if not uid:
-            skipped += 1
-            continue
-        if uid in existing:
-            if update_existing:
-                update_task(token, existing[uid]["id"], ev, DEFAULT_MARKER, dry_run)
-                updated += 1
-            else:
-                skipped += 1
-        else:
-            create_task(token, project_id, ev, DEFAULT_MARKER, dry_run)
-            created += 1
-
-    for uid, task in existing.items():
-        if uid not in ical_uids:
-            print(f"Deleting task {task['id']} (event UID {uid} missing from calendar)")
-            delete_task(token, task["id"], dry_run)
-            deleted += 1
-
-    print(f"Done. Created={created}, Updated={updated}, Deleted={deleted}, Skipped={skipped}")
-
-if __name__ == "__main__":
-    main()
+# ---------------- LAMBDA HANDLER ----------------
+def lambda_handler(event, context):
+    try:
+        cfg = load_config()
+        result = sync_once(cfg)
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"status": "ok", "result": result}),
+        }
+    except Exception as e:
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"status": "error", "message": str(e)}),
+        }
