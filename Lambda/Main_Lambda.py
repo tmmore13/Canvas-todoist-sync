@@ -1,15 +1,27 @@
 #!/usr/bin/env python3
 """
-Sync an iCalendar (ICS) feed to a Todoist project with duplicate protection.
+Sync an iCalendar (ICS) feed to a Todoist project, using a config file.
 
-Usage:
-    TODOIST_API_TOKEN="your_api_token" \
-    python ical_to_todoist.py --ical-url "https://example.com/calendar.ics" --project-id "6cjCMX4c4QfqfqqH"
+Features:
+- Creates tasks for new events
+- Updates tasks when events change (if update_existing: true)
+- Deletes tasks when events are removed from the calendar
+
+Config:
+    Provide config.json or config.yaml with keys:
+    {
+      "ical_url": "...",
+      "todoist_token": "...",
+      "project_id": "...",
+      "update_existing": true,
+      "dry_run": false
+    }
 """
 
 import os
 import re
-import argparse
+import json
+import yaml   # pip install pyyaml
 import requests
 from datetime import datetime, date
 from dateutil import tz
@@ -22,10 +34,21 @@ DEFAULT_MARKER = "ICUID:"
 # Helpers
 # -------------------------
 
+def load_config(path="config.json"):
+    """Load JSON or YAML config file."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Config file not found: {path}")
+    if path.endswith(".json"):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    if path.endswith((".yml", ".yaml")):
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
+    raise ValueError("Config file must be .json or .yaml")
+
 def isoformat_for_todoist(dt):
-    """Convert datetime/date to Todoist format."""
     if isinstance(dt, date) and not isinstance(dt, datetime):
-        return dt.isoformat()  # all-day
+        return dt.isoformat()
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=tz.tzutc())
     return dt.isoformat()
@@ -52,8 +75,7 @@ def headers(token):
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 def list_tasks(token, project_id):
-    url = f"{TODOIST_API_BASE}/tasks"
-    r = requests.get(url, headers=headers(token), params={"project_id": project_id})
+    r = requests.get(f"{TODOIST_API_BASE}/tasks", headers=headers(token), params={"project_id": project_id})
     r.raise_for_status()
     return r.json()
 
@@ -108,27 +130,33 @@ def update_task(token, task_id, event, marker, dry_run=False):
     if r.status_code not in (200, 204):
         r.raise_for_status()
 
+def delete_task(token, task_id, dry_run=False):
+    if dry_run:
+        print(f"[DRY RUN] Would delete task {task_id}")
+        return
+    r = requests.delete(f"{TODOIST_API_BASE}/tasks/{task_id}", headers=headers(token))
+    if r.status_code not in (200, 204):
+        r.raise_for_status()
+
 # -------------------------
 # Main
 # -------------------------
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ical-url", required=True)
-    parser.add_argument("--project-id", required=True, help="Todoist project ID (string)")
-    parser.add_argument("--todoist-token", default=os.getenv("TODOIST_API_TOKEN"))
-    parser.add_argument("--update-existing", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
+    cfg = load_config("config.json")  # change to config.yaml if needed
 
-    if not args.todoist_token:
-        raise SystemExit("Missing Todoist API token (set TODOIST_API_TOKEN env var).")
+    ical_url = cfg["ical_url"]
+    token = cfg["todoist_token"]
+    project_id = cfg["project_id"]
+    update_existing = cfg.get("update_existing", False)
+    dry_run = cfg.get("dry_run", False)
 
-    events = parse_ics(fetch_ics(args.ical_url))
-    tasks = list_tasks(args.todoist_token, args.project_id)
+    events = parse_ics(fetch_ics(ical_url))
+    tasks = list_tasks(token, project_id)
     existing = find_existing(tasks)
 
-    created, updated, skipped = 0, 0, 0
+    ical_uids = {ev["uid"] for ev in events if ev["uid"]}
+    created, updated, skipped, deleted = 0, 0, 0, 0
 
     for ev in events:
         uid = ev["uid"]
@@ -136,16 +164,22 @@ def main():
             skipped += 1
             continue
         if uid in existing:
-            if args.update_existing:
-                update_task(args.todoist_token, existing[uid]["id"], ev, DEFAULT_MARKER, dry_run=args.dry_run)
+            if update_existing:
+                update_task(token, existing[uid]["id"], ev, DEFAULT_MARKER, dry_run)
                 updated += 1
             else:
                 skipped += 1
         else:
-            create_task(args.todoist_token, args.project_id, ev, DEFAULT_MARKER, dry_run=args.dry_run)
+            create_task(token, project_id, ev, DEFAULT_MARKER, dry_run)
             created += 1
 
-    print(f"Done. Created={created}, Updated={updated}, Skipped={skipped}")
+    for uid, task in existing.items():
+        if uid not in ical_uids:
+            print(f"Deleting task {task['id']} (event UID {uid} missing from calendar)")
+            delete_task(token, task["id"], dry_run)
+            deleted += 1
+
+    print(f"Done. Created={created}, Updated={updated}, Deleted={deleted}, Skipped={skipped}")
 
 if __name__ == "__main__":
     main()
